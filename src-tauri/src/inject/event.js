@@ -1,11 +1,35 @@
+// Prefer native webview navigation over page JS so Ctrl+R / [ / ] still work
+// on blank error shells (no JS context). Falls back to history/location when
+// the IPC bridge is unavailable.
+function nativeNavigate(action) {
+  const invoke = window.__TAURI__?.core?.invoke;
+  if (invoke) {
+    invoke("webview_navigate", { action }).catch(() => {
+      fallbackNavigate(action);
+    });
+    return;
+  }
+  fallbackNavigate(action);
+}
+
+function fallbackNavigate(action) {
+  if (action === "reload") {
+    window.location.reload();
+  } else if (action === "back") {
+    window.history.back();
+  } else if (action === "forward") {
+    window.history.forward();
+  }
+}
+
 const shortcuts = {
-  "[": () => window.history.back(),
-  "]": () => window.history.forward(),
+  "[": () => nativeNavigate("back"),
+  "]": () => nativeNavigate("forward"),
   "-": () => zoomOut(),
   "=": () => zoomIn(),
   "+": () => zoomIn(),
   0: () => setZoom("100%"),
-  r: () => window.location.reload(),
+  r: () => nativeNavigate("reload"),
   ArrowUp: () => scrollTo(0, 0),
   ArrowDown: () => scrollTo(0, document.body.scrollHeight),
 };
@@ -57,6 +81,20 @@ function handleShortcut(event) {
   if (shortcuts[event.key]) {
     event.preventDefault();
     shortcuts[event.key]();
+  }
+}
+
+function handleWebShortcut(event) {
+  if (isNonMacDesktop() && event.ctrlKey) {
+    handleShortcut(event);
+    return;
+  }
+
+  const isMac = /mac/i.test(getDesktopPlatform());
+  const isMacScrollShortcut =
+    event.key === "ArrowUp" || event.key === "ArrowDown";
+  if (isMac && event.metaKey && isMacScrollShortcut) {
+    handleShortcut(event);
   }
 }
 
@@ -206,19 +244,14 @@ function insertTextIntoEditableElement(element, text) {
   return false;
 }
 
-function runBrowserPasteCommand() {
-  try {
-    return document.execCommand("paste") === true;
-  } catch (error) {
-    return false;
-  }
-}
+let clipboardPasteFallbackTarget;
+let clipboardPasteFallbackArmedAt = 0;
+// An armed fallback older than this is a leftover from a keyup the window
+// never saw (alt-tab mid-press); firing it on a later plain "v" keyup would
+// paste unexpectedly.
+const CLIPBOARD_PASTE_FALLBACK_TTL_MS = 5000;
 
 function pasteClipboardText(activeElement) {
-  if (runBrowserPasteCommand()) {
-    return;
-  }
-
   const readText = navigator.clipboard?.readText;
   if (typeof readText !== "function") {
     return;
@@ -261,9 +294,19 @@ function handleClipboardShortcut(event) {
   }
 
   if (key === "v" && canPasteIntoEditableElement(activeElement)) {
-    event.preventDefault();
-    pasteClipboardText(activeElement);
-    return true;
+    // Let the native WebView paste event run first so images, files, and rich
+    // clipboard formats remain intact. If the platform does not emit paste,
+    // keyup applies the existing text-only fallback. Key-repeat must not
+    // re-arm: after a native paste already fired and disarmed the fallback,
+    // a repeat keydown re-arming it would make keyup paste text a second
+    // time. Repeats only refresh the TTL of a still-armed target.
+    if (!event.repeat) {
+      clipboardPasteFallbackTarget = activeElement;
+      clipboardPasteFallbackArmedAt = Date.now();
+    } else if (clipboardPasteFallbackTarget === activeElement) {
+      clipboardPasteFallbackArmedAt = Date.now();
+    }
+    return false;
   }
 
   if (key === "a" && isEditable && selectEditableElement(activeElement)) {
@@ -272,6 +315,44 @@ function handleClipboardShortcut(event) {
   }
 
   return false;
+}
+
+function handleClipboardPasteFallback(event) {
+  if (
+    event.isTrusted !== true ||
+    !isNonMacDesktop() ||
+    event.key?.toLowerCase() !== "v"
+  ) {
+    return false;
+  }
+
+  const activeElement = clipboardPasteFallbackTarget;
+  const armedAt = clipboardPasteFallbackArmedAt;
+  clipboardPasteFallbackTarget = undefined;
+  if (
+    !activeElement ||
+    Date.now() - armedAt > CLIPBOARD_PASTE_FALLBACK_TTL_MS ||
+    document.activeElement !== activeElement ||
+    !canPasteIntoEditableElement(activeElement)
+  ) {
+    return false;
+  }
+
+  pasteClipboardText(activeElement);
+  return true;
+}
+
+function handlePaste(event) {
+  clipboardPasteFallbackTarget = undefined;
+  if (!pasteAsPlainTextPending) return;
+
+  event.preventDefault();
+  event.stopImmediatePropagation();
+
+  const text = event.clipboardData?.getData("text/plain") || "";
+  if (text) {
+    document.execCommand("insertText", false, text);
+  }
 }
 
 const DOWNLOADABLE_FILE_EXTENSIONS = {
@@ -313,34 +394,12 @@ const DOWNLOADABLE_FILE_EXTENSIONS = {
     "apk",
     "ipa",
   ],
-  data: [
-    "json",
-    "xml",
-    "csv",
-    "sql",
-    "db",
-    "sqlite",
-    "yaml",
-    "yml",
-    "toml",
-    "ini",
-    "cfg",
-    "conf",
-    "log",
-  ],
-  code: [
-    "js",
-    "ts",
-    "jsx",
-    "tsx",
-    "css",
-    "scss",
-    "sass",
-    "less",
-    "sh",
-    "bat",
-    "ps1",
-  ],
+  // Navigable web formats (json/xml/js/css/html and friends) are intentionally
+  // omitted: documentation and SPA content negotiation often serve them as
+  // in-app pages. Real file downloads still match via the download attribute,
+  // ?download / ?attachment, or binary extensions below.
+  data: ["csv", "sql", "db", "sqlite"],
+  scripts: ["sh", "bat", "ps1"],
   fonts: ["ttf", "otf", "woff", "woff2", "eot"],
   design: ["ai", "psd", "sketch", "fig", "xd"],
   system: [
@@ -389,14 +448,12 @@ const PREVIEWABLE_MEDIA_EXTENSIONS = [
   "m4a",
 ];
 
-const DOWNLOAD_PATH_PATTERNS = [
-  "/download/",
-  "/files/",
-  "/attachments/",
-  "/assets/",
-  "/releases/",
-  "/dist/",
-];
+// Path fragments that often host real file downloads. Keep this list narrow:
+// SPA roots such as "/assets/", "/dist/", "/files/", "/releases/", and
+// "/attachments/" have already been mistaken for downloads in the wild.
+// Prefer real file extensions, the download attribute, or ?download /
+// ?attachment query hints whenever possible.
+const DOWNLOAD_PATH_PATTERNS = ["/download/"];
 
 // Language detection utilities
 function getUserLanguage() {
@@ -470,6 +527,52 @@ function isDownloadableFile(url) {
   } catch (e) {
     return false;
   }
+}
+
+// Public suffixes where the registrable domain needs more than two labels.
+// Not exhaustive; covers common packaging targets that last-two-label
+// matching would collapse incorrectly (e.g. amazon.co.uk vs evil.co.uk,
+// or every *.github.io site into one "domain").
+const MULTI_PART_PUBLIC_SUFFIXES = [
+  "co.uk",
+  "org.uk",
+  "ac.uk",
+  "gov.uk",
+  "com.au",
+  "net.au",
+  "org.au",
+  "co.jp",
+  "ne.jp",
+  "or.jp",
+  "co.kr",
+  "co.in",
+  "com.br",
+  "com.cn",
+  "com.tw",
+  "com.hk",
+  "com.sg",
+  "github.io",
+  "gitlab.io",
+  "pages.dev",
+];
+
+function getRootDomain(hostname) {
+  const normalized = String(hostname || "").toLowerCase();
+  if (!normalized) {
+    return "";
+  }
+
+  const parts = normalized.split(".").filter(Boolean);
+  if (parts.length <= 1) {
+    return normalized;
+  }
+
+  const lastTwo = parts.slice(-2).join(".");
+  if (MULTI_PART_PUBLIC_SUFFIXES.includes(lastTwo) && parts.length >= 3) {
+    return parts.slice(-3).join(".");
+  }
+
+  return lastTwo;
 }
 
 function normalizeAnchorHref(rawHref) {
@@ -579,33 +682,12 @@ document.addEventListener("DOMContentLoaded", () => {
 
   if (window["pakeConfig"]?.disabled_web_shortcuts !== true) {
     document.addEventListener("keydown", handleWindowFullscreenShortcut, true);
-    document.addEventListener("keyup", (event) => {
-      if (/windows|linux/i.test(navigator.userAgent) && event.ctrlKey) {
-        handleShortcut(event);
-      }
-      if (/macintosh|mac os x/i.test(navigator.userAgent) && event.metaKey) {
-        handleShortcut(event);
-      }
-    });
+    document.addEventListener("keyup", handleWebShortcut);
   }
 
   document.addEventListener("keydown", handleClipboardShortcut, true);
-
-  document.addEventListener(
-    "paste",
-    (event) => {
-      if (pasteAsPlainTextPending) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-
-        const text = event.clipboardData?.getData("text/plain") || "";
-        if (text) {
-          document.execCommand("insertText", false, text);
-        }
-      }
-    },
-    true,
-  );
+  document.addEventListener("keyup", handleClipboardPasteFallback, true);
+  document.addEventListener("paste", handlePaste, true);
 
   // Trigger a native browser download via a transient anchor click. The Rust
   // on_download handler then writes the file to the Downloads folder. This is
@@ -626,8 +708,11 @@ document.addEventListener("DOMContentLoaded", () => {
   const isSpecialDownload = (url) =>
     ["blob", "data"].some((protocol) => url.startsWith(protocol));
 
-  const isDownloadRequired = (url, anchorElement, e) =>
-    anchorElement.download || e.metaKey || e.ctrlKey || isDownloadableFile(url);
+  // Cmd/Ctrl+click is a browser "open related" gesture, not "save as".
+  // Only the download attribute and downloadable-file heuristics force a
+  // download; modifiers must not rewrite ordinary navigation.
+  const isDownloadRequired = (url, anchorElement, _e) =>
+    Boolean(anchorElement.download) || isDownloadableFile(url);
 
   const handleExternalLink = (url) => {
     // Don't try to open blob: or data: URLs with shell
@@ -651,12 +736,8 @@ document.addEventListener("DOMContentLoaded", () => {
 
       if (linkUrl.hostname === currentUrl.hostname) return true;
 
-      // Extract root domain (e.g., bilibili.com from www.bilibili.com)
-      const getRootDomain = (hostname) => {
-        const parts = hostname.split(".");
-        return parts.length >= 2 ? parts.slice(-2).join(".") : hostname;
-      };
-
+      // e.g. www.bilibili.com and m.bilibili.com share bilibili.com;
+      // amazon.co.uk must not share a root with evil.co.uk.
       return (
         getRootDomain(currentUrl.hostname) === getRootDomain(linkUrl.hostname)
       );
